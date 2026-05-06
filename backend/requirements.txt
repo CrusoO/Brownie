@@ -1,0 +1,7 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+langgraph>=0.2.60
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+chromadb>=0.5.20
+pydantic>=2.8.0
