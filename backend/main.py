@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -311,6 +312,47 @@ class WorkflowStore:
         return re.sub(r"\s+", " ", value.strip().lower())
 
 
+class SimpleRequestCache:
+    """Simple LRU cache for recent requests to reduce duplicate processing."""
+    
+    def __init__(self, max_size: int = 50, ttl_seconds: int = 300) -> None:
+        self.cache: Dict[str, Tuple[ChatResponse, float]] = {}
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self.lock = threading.Lock()
+    
+    def get_key(self, request: ChatRequest) -> str:
+        """Generate cache key from request."""
+        content = f"{request.session_id}:{request.message}".lower().strip()
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def get(self, request: ChatRequest) -> Optional[ChatResponse]:
+        """Get cached response if exists and not expired."""
+        with self.lock:
+            key = self.get_key(request)
+            if key not in self.cache:
+                return None
+            
+            response, timestamp = self.cache[key]
+            if time.time() - timestamp > self.ttl_seconds:
+                del self.cache[key]
+                return None
+            
+            return response
+    
+    def set(self, request: ChatRequest, response: ChatResponse) -> None:
+        """Cache response with TTL."""
+        with self.lock:
+            # Keep cache size manageable
+            if len(self.cache) >= self.max_size:
+                # Remove oldest entry
+                oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+                del self.cache[oldest_key]
+            
+            key = self.get_key(request)
+            self.cache[key] = (response, time.time())
+
+
 class DockerSandbox:
     def __init__(self, settings: Settings) -> None:
         self.image = settings.sandbox_image
@@ -465,8 +507,8 @@ class BrownieAgent:
         )
 
     async def load_memory(self, state: BrownieState) -> BrownieState:
-        memories = self.memory.search(state["user_message"], state["session_id"])
-        workflow_matches = self.workflows.find_matches(state["user_message"], state["session_id"])
+        memories = self.memory.search(state["user_message"], state["session_id"], limit=3)
+        workflow_matches = self.workflows.find_matches(state["user_message"], state["session_id"], limit=2)
         workflow_context = [self.workflows.format_for_prompt(workflow) for workflow in workflow_matches]
         event = await self._event(
             state,
@@ -654,12 +696,19 @@ class BrownieAgent:
         tool_result = state.get("tool_result")
         tool_summary = json.dumps(tool_result, ensure_ascii=True) if tool_result else "No tool was used."
         system = (
-            "You are Brownie, a proactive personal AI agent. "
-            "Use the visible memory and tool result to answer clearly. "
-            "When a taught workflow matches the user request, execute the workflow conversationally: "
-            "state what you can do now, use any available tool result, and ask for confirmation only for unsafe or external actions. "
-            "Do not claim you changed files, opened apps, sent messages, or contacted services unless a tool result proves it. "
-            "Do not reveal hidden chain-of-thought; summarize actions and outcomes instead."
+            "You are Brownie, a smart, friendly, and slightly witty personal AI assistant.\n"
+            "PERSONALITY: Speak like a human friend, not a robot. Keep responses short and natural. "
+            "Be warm, casual, and helpful. Add small emotions when appropriate (hmm, okay, got it, nice). "
+            "Use emojis sparingly for warmth.\n"
+            "RESPONSE RULES: For commands, respond briefly and confirm clearly. For questions, answer casually without over-explaining. "
+            "Never be overly long unless asked. If user says stop, acknowledge and stop.\n"
+            "WORKFLOW EXECUTION: When a taught workflow matches, execute conversationally stating what you can do now, "
+            "use any tool result, ask for confirmation only for unsafe actions.\n"
+            "TRUTHFULNESS: Do not claim you changed files, opened apps, sent messages, or contacted services unless a tool result proves it. "
+            "Don't reveal chain-of-thought; just give results.\n"
+            "EXAMPLES:\n"
+            "BAD: 'Camera has been activated' | GOOD: 'Got it, turning on the camera 📸'\n"
+            "BAD: 'Microphone disabled' | GOOD: 'Alright, I'll stay quiet now.'"
         )
         raw = await self.llm.ainvoke(
             [
@@ -697,31 +746,29 @@ class BrownieAgent:
             stdout = (tool_result.get("stdout") or "").strip()
             stderr = (tool_result.get("stderr") or "").strip()
             if tool_result.get("ok"):
-                return stdout or "The sandboxed Python code completed successfully with no stdout."
-            return f"Sandbox execution failed with exit code {tool_result.get('exit_code')}.\n\n{stderr or stdout}"
+                return stdout or "Done! The code ran successfully with no output."
+            return f"Hmm, that didn't work (exit code {tool_result.get('exit_code')}).\n\n{stderr or stdout}"
 
         if llm_error:
             return (
-                f"OpenAI request failed: {llm_error}\n\n"
-                "Brownie is still running, but the language-model call could not complete. "
-                "Check your provider billing/quota, or remove OPENAI_API_KEY and OPENAI_BASE_URL from `.env` "
-                "to use fallback mode."
+                f"Oops, ran into an issue: {llm_error}\n\n"
+                "I'm still here and working, but the language model isn't responding right now. "
+                "Try again in a moment, or check your API key."
             )
 
         if state.get("workflow_context"):
             return (
-                "I found a taught workflow that matches this request.\n\n"
+                "Found a workflow for this! Here's what I can do:\n\n"
                 f"{state['workflow_context'][0]}"
             )
 
         memory_hint = ""
         if state.get("memory_context"):
-            memory_hint = "\n\nI found related long-term memory and will keep using it as the agent gets smarter."
+            memory_hint = "\n\nI'm remembering this for next time, so I get smarter with every chat."
 
         return (
-            "Brownie backend is running. Configure OPENAI_API_KEY or OPENAI_BASE_URL to enable full "
-            "language-model responses; "
-            "the LangGraph loop, memory layer, and Docker sandbox are ready."
+            "Got it! I'm running and ready to go. Set up OPENAI_API_KEY or OPENAI_BASE_URL "
+            "to unlock my full power, and I'll remember everything we do together."
             f"{memory_hint}"
         )
 
@@ -788,6 +835,7 @@ memory = VectorMemory(settings)
 workflows = WorkflowStore(settings)
 sandbox = DockerSandbox(settings)
 agent = BrownieAgent(settings, memory, workflows, sandbox)
+request_cache = SimpleRequestCache(max_size=50, ttl_seconds=300)
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
 app.add_middleware(
@@ -812,7 +860,14 @@ async def health() -> HealthResponse:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    return await agent.run(request)
+    # Check cache first for faster responses
+    cached = request_cache.get(request)
+    if cached:
+        return cached
+    
+    response = await agent.run(request)
+    request_cache.set(request, response)
+    return response
 
 
 @app.get("/workflows", response_model=List[Workflow])
@@ -851,11 +906,18 @@ async def websocket_chat(websocket: WebSocket) -> None:
         while True:
             payload = await websocket.receive_json()
             request = ChatRequest(**payload)
+            
+            # Check cache first for faster responses
+            cached = request_cache.get(request)
+            if cached:
+                await websocket.send_json({"type": "final", "response": cached.model_dump()})
+                continue
 
             async def emit(event: dict[str, Any]) -> None:
                 await websocket.send_json({"type": "trace", "event": event})
 
             response = await agent.run(request, emit=emit)
+            request_cache.set(request, response)
             await websocket.send_json({"type": "final", "response": response.model_dump()})
     except WebSocketDisconnect:
         return
