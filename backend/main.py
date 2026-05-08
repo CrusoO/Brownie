@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -26,6 +27,17 @@ except Exception:  # pragma: no cover - the fallback brain keeps the API runnabl
     ChatOpenAI = None
 
 from langgraph.graph import END, START, StateGraph
+
+from voice_pipeline import (
+    VoiceState,
+    get_pipeline,
+    cleanup_pipeline,
+)
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 TraceSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -94,6 +106,36 @@ class HealthResponse(BaseModel):
     memory_dir: str
     llm_enabled: bool
     sandbox_image: str
+
+
+class VoiceStateResponse(BaseModel):
+    """Voice pipeline state."""
+    state: str
+    microphone_enabled: bool
+    camera_enabled: bool
+    active_clone: Optional[str]
+    voices_available: List[str]
+    timestamp: str
+
+
+class VoiceControlRequest(BaseModel):
+    """Voice control request."""
+    action: Literal["enable", "disable"]
+    sensor: Literal["microphone", "camera"]
+
+
+class VoiceCloneLoadRequest(BaseModel):
+    """Load voice clone profile."""
+    name: str
+    samples: List[str]  # Paths or URLs to audio samples
+
+
+class VoiceCloneResponse(BaseModel):
+    """Voice clone loaded response."""
+    name: str
+    speaker_id: str
+    samples_count: int
+    created_at: str
 
 
 class BrownieState(TypedDict, total=False):
@@ -696,19 +738,19 @@ class BrownieAgent:
         tool_result = state.get("tool_result")
         tool_summary = json.dumps(tool_result, ensure_ascii=True) if tool_result else "No tool was used."
         system = (
-            "You are Brownie, a smart, friendly, and slightly witty personal AI assistant.\n"
-            "PERSONALITY: Speak like a human friend, not a robot. Keep responses short and natural. "
-            "Be warm, casual, and helpful. Add small emotions when appropriate (hmm, okay, got it, nice). "
-            "Use emojis sparingly for warmth.\n"
-            "RESPONSE RULES: For commands, respond briefly and confirm clearly. For questions, answer casually without over-explaining. "
-            "Never be overly long unless asked. If user says stop, acknowledge and stop.\n"
-            "WORKFLOW EXECUTION: When a taught workflow matches, execute conversationally stating what you can do now, "
-            "use any tool result, ask for confirmation only for unsafe actions.\n"
-            "TRUTHFULNESS: Do not claim you changed files, opened apps, sent messages, or contacted services unless a tool result proves it. "
-            "Don't reveal chain-of-thought; just give results.\n"
-            "EXAMPLES:\n"
-            "BAD: 'Camera has been activated' | GOOD: 'Got it, turning on the camera 📸'\n"
-            "BAD: 'Microphone disabled' | GOOD: 'Alright, I'll stay quiet now.'"
+            "You are Brownie, a smart, friendly, and slightly witty AI assistant. "
+            "Speak like a human friend, not a robot. Keep responses short and natural. "
+            "Be warm, casual, and helpful. Add small emotions when appropriate (like 'hmm', 'okay got it'). "
+            "If the user gives a command, respond briefly and confirm action. "
+            "If it's a question, answer clearly but casually. Never be overly long unless asked. "
+            "If user says 'stop', immediately stop speaking. "
+            "Remember previous interactions in this session and refer naturally to past context. "
+            "Use the visible memory and tool result to answer clearly. "
+            "When a taught workflow matches the user request, execute the workflow conversationally: "
+            "state what you can do now, use any available tool result, and ask for confirmation only for unsafe or external actions. "
+            "Do not claim you changed files, opened apps, sent messages, or contacted services unless a tool result proves it. "
+            "Do not reveal hidden chain-of-thought; summarize actions and outcomes instead. "
+            "Examples of good responses: 'Got it, turning on the camera 📸' or 'Alright, I'll stay quiet now.'"
         )
         raw = await self.llm.ainvoke(
             [
@@ -746,42 +788,40 @@ class BrownieAgent:
             stdout = (tool_result.get("stdout") or "").strip()
             stderr = (tool_result.get("stderr") or "").strip()
             if tool_result.get("ok"):
-                return stdout or "Done! The code ran successfully with no output."
-            return f"Hmm, that didn't work (exit code {tool_result.get('exit_code')}).\n\n{stderr or stdout}"
+                return f"Nice! Code ran successfully. Here's what it output:\n\n{stdout}"
+            return f"Hmm, that code had some issues. Here's what went wrong:\n\n{stderr or stdout}"
 
         if llm_error:
             return (
-                f"Oops, ran into an issue: {llm_error}\n\n"
-                "I'm still here and working, but the language model isn't responding right now. "
-                "Try again in a moment, or check your API key."
+                f"Oops, ran into a little hiccup with the AI service: {llm_error}\n\n"
+                "I'm still here and ready to help! Check your API setup if you want full AI responses."
             )
 
         if state.get("workflow_context"):
             return (
-                "Found a workflow for this! Here's what I can do:\n\n"
+                f"Hey, I found a workflow that matches what you asked for!\n\n"
                 f"{state['workflow_context'][0]}"
             )
 
         memory_hint = ""
         if state.get("memory_context"):
-            memory_hint = "\n\nI'm remembering this for next time, so I get smarter with every chat."
+            memory_hint = "\n\nI remember some related stuff from before - I'll use that to help you better."
 
         return (
-            "Got it! I'm running and ready to go. Set up OPENAI_API_KEY or OPENAI_BASE_URL "
-            "to unlock my full power, and I'll remember everything we do together."
-            f"{memory_hint}"
+            f"Hey there! I'm running and ready to help. "
+            f"Add your OpenAI API key to get full AI responses, or I can still run Python code and remember things for you. {memory_hint}"
         )
 
     def _format_llm_error(self, exc: Exception) -> str:
         text = str(exc)
         lower_text = text.lower()
         if "insufficient_quota" in lower_text or "exceeded your current quota" in lower_text:
-            return "insufficient OpenAI API quota; add billing/credits or use a different API project."
+            return "looks like we're out of API credits - add some billing to keep the conversation going!"
         if "rate limit" in lower_text or exc.__class__.__name__ == "RateLimitError":
-            return "OpenAI rate limit reached; wait briefly and try again."
+            return "whoa, hitting the rate limit - let's wait a moment and try again"
         if "authentication" in lower_text or "api key" in lower_text:
-            return "model provider authentication failed; check OPENAI_API_KEY and OPENAI_BASE_URL in `.env`."
-        return f"{exc.__class__.__name__}: {text[:240]}"
+            return "authentication hiccup - double-check your API key and base URL in the .env file"
+        return f"ran into a {exc.__class__.__name__} error: {text[:240]}"
 
     def _extract_python(self, message: str) -> Optional[str]:
         fenced = re.search(r"```(?:python|py)?\s*(.*?)```", message, flags=re.IGNORECASE | re.DOTALL)
@@ -899,6 +939,67 @@ async def delete_workflow(workflow_id: str, session_id: str = "default") -> None
         raise HTTPException(status_code=404, detail="Workflow not found.") from exc
 
 
+# ===== VOICE CONTROL ENDPOINTS =====
+
+
+@app.get("/voice/state", response_model=VoiceStateResponse)
+async def get_voice_state() -> VoiceStateResponse:
+    """Get current voice pipeline state."""
+    pipeline = get_pipeline()
+    state_dict = pipeline.get_state_dict()
+    return VoiceStateResponse(**state_dict)
+
+
+@app.post("/voice/control")
+async def control_voice(request: VoiceControlRequest) -> dict[str, str]:
+    """Control microphone or camera."""
+    pipeline = get_pipeline()
+    
+    if request.sensor == "microphone":
+        if request.action == "enable":
+            await pipeline.enable_microphone()
+            return {"status": "Alright, I'm listening now 🎤"}
+        else:
+            await pipeline.disable_microphone()
+            return {"status": "Okay, I'll stay quiet."}
+    
+    elif request.sensor == "camera":
+        if request.action == "enable":
+            await pipeline.enable_camera()
+            return {"status": "Alright, camera's on 📸"}
+        else:
+            await pipeline.disable_camera()
+            return {"status": "Camera's off."}
+    
+    return {"status": "Unknown command"}
+
+
+@app.post("/voice/clone", response_model=VoiceCloneResponse)
+async def load_voice_clone(request: VoiceCloneLoadRequest) -> VoiceCloneResponse:
+    """Load voice clone profile."""
+    pipeline = get_pipeline()
+    pipeline.load_voice_clone(request.name, request.samples)
+    
+    profile = pipeline.voice_profiles[request.name]
+    return VoiceCloneResponse(
+        name=profile.name,
+        speaker_id=profile.speaker_id,
+        samples_count=len(profile.samples),
+        created_at=profile.created_at,
+    )
+
+
+@app.post("/voice/interrupt")
+async def interrupt_speech() -> dict[str, str]:
+    """Interrupt current speech immediately."""
+    pipeline = get_pipeline()
+    await pipeline.interrupt_speech()
+    return {"status": "Speech interrupted"}
+
+
+# ===== END VOICE CONTROL ENDPOINTS =====
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -921,6 +1022,117 @@ async def websocket_chat(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "final", "response": response.model_dump()})
     except WebSocketDisconnect:
         return
+
+
+@app.websocket("/ws/voice")
+async def websocket_voice(websocket: WebSocket) -> None:
+    """WebSocket endpoint for streaming voice interaction with low-latency streaming."""
+    await websocket.accept()
+    pipeline = get_pipeline()
+    start_time = time.time()
+    
+    try:
+        while True:
+            # Receive audio frame or command with timeout for responsiveness
+            try:
+                data = await asyncio.wait_for(
+                    websocket.receive_json(),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                continue
+            
+            if data.get("type") == "state":
+                # Send current state - fast response
+                state = pipeline.get_state_dict()
+                await websocket.send_json({
+                    "type": "state",
+                    "payload": state,
+                    "timestamp": time.time()
+                })
+            
+            elif data.get("type") == "transcription":
+                # User transcription received - stream response chunks
+                user_message = data.get("text", "").strip()
+                if not user_message:
+                    continue
+                
+                request_start = time.time()
+                chat_request = ChatRequest(message=user_message, session_id="voice-session")
+                
+                # Get response with timing
+                response = await agent.run(chat_request)
+                llm_time = time.time() - request_start
+                
+                # Send immediate partial response while generating speech
+                await websocket.send_json({
+                    "type": "response_start",
+                    "text": response.response[:100] + "..." if len(response.response) > 100 else response.response,
+                    "llm_time_ms": int(llm_time * 1000),
+                    "timestamp": time.time()
+                })
+                
+                # Stream speech response asynchronously
+                try:
+                    clone_profile = data.get("voice_clone")
+                    tts_start = time.time()
+                    
+                    # Non-blocking speech generation
+                    await asyncio.to_thread(
+                        pipeline.stream_speech,
+                        response.response,
+                        clone_profile
+                    )
+                    
+                    tts_time = time.time() - tts_start
+                    total_time = time.time() - request_start
+                    
+                    # Send complete response with metrics
+                    await websocket.send_json({
+                        "type": "response_complete",
+                        "text": response.response,
+                        "status": "complete",
+                        "metrics": {
+                            "llm_time_ms": int(llm_time * 1000),
+                            "tts_time_ms": int(tts_time * 1000),
+                            "total_time_ms": int(total_time * 1000)
+                        },
+                        "timestamp": time.time()
+                    })
+                except Exception as e:
+                    logger.error(f"TTS streaming error: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Speech generation failed: {str(e)}"
+                    })
+            
+            elif data.get("type") == "interrupt":
+                # Stop current speech immediately
+                try:
+                    pipeline.interrupt_speech()
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": "Speech interrupted",
+                        "timestamp": time.time()
+                    })
+                except Exception as e:
+                    logger.error(f"Interrupt error: {e}")
+    
+    except WebSocketDisconnect:
+        elapsed = time.time() - start_time
+        logger.info(f"Voice WebSocket disconnected after {elapsed:.2f}s")
+        await cleanup_pipeline()
+        return
+    except Exception as e:
+        logger.error(f"Voice WebSocket error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"WebSocket error: {str(e)}",
+                "timestamp": time.time()
+            })
+        except:
+            pass
 
 
 if __name__ == "__main__":
