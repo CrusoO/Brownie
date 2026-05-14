@@ -549,8 +549,18 @@ class BrownieAgent:
         )
 
     async def load_memory(self, state: BrownieState) -> BrownieState:
-        memories = self.memory.search(state["user_message"], state["session_id"], limit=3)
-        workflow_matches = self.workflows.find_matches(state["user_message"], state["session_id"], limit=2)
+        memories = await asyncio.to_thread(
+            self.memory.search,
+            state["user_message"],
+            state["session_id"],
+            3,
+        )
+        workflow_matches = await asyncio.to_thread(
+            self.workflows.find_matches,
+            state["user_message"],
+            state["session_id"],
+            2,
+        )
         workflow_context = [self.workflows.format_for_prompt(workflow) for workflow in workflow_matches]
         event = await self._event(
             state,
@@ -566,14 +576,22 @@ class BrownieAgent:
 
     async def decide(self, state: BrownieState) -> BrownieState:
         llm_error = None
-        if self.llm:
+        message = state["user_message"]
+        heuristic_decision = self._fallback_decision(message)
+        should_use_llm_router = (
+            self.llm is not None
+            and self._needs_llm_routing(message)
+            and heuristic_decision.get("route") != "tool"
+        )
+
+        if should_use_llm_router:
             try:
                 decision = await self._llm_decision(state)
             except Exception as exc:
                 llm_error = self._format_llm_error(exc)
-                decision = self._fallback_decision(state["user_message"])
+                decision = heuristic_decision
         else:
-            decision = self._fallback_decision(state["user_message"])
+            decision = heuristic_decision
 
         event_data = {
             "route": decision["route"],
@@ -663,7 +681,8 @@ class BrownieAgent:
         return updates
 
     async def persist_memory(self, state: BrownieState) -> BrownieState:
-        memory_id = self.memory.remember(
+        memory_id = await asyncio.to_thread(
+            self.memory.remember,
             session_id=state["session_id"],
             action=state["user_message"],
             outcome=state.get("response", ""),
@@ -811,6 +830,19 @@ class BrownieAgent:
             f"Hey there! I'm running and ready to help. "
             f"Add your OpenAI API key to get full AI responses, or I can still run Python code and remember things for you. {memory_hint}"
         )
+
+    def _needs_llm_routing(self, message: str) -> bool:
+        lowered = message.lower()
+        routing_markers = (
+            "python",
+            "py",
+            "code",
+            "script",
+            "execute",
+            "run",
+            "```",
+        )
+        return any(marker in lowered for marker in routing_markers)
 
     def _format_llm_error(self, exc: Exception) -> str:
         text = str(exc)
@@ -1060,9 +1092,14 @@ async def websocket_voice(websocket: WebSocket) -> None:
                 request_start = time.time()
                 chat_request = ChatRequest(message=user_message, session_id="voice-session")
                 
-                # Get response with timing
-                response = await agent.run(chat_request)
-                llm_time = time.time() - request_start
+                cached = request_cache.get(chat_request)
+                if cached:
+                    response = cached
+                    llm_time = 0.0
+                else:
+                    response = await agent.run(chat_request)
+                    llm_time = time.time() - request_start
+                    request_cache.set(chat_request, response)
                 
                 # Send immediate partial response while generating speech
                 await websocket.send_json({
