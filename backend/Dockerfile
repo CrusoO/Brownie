@@ -15,8 +15,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
-COPY voice_pipeline.py .
+COPY main.py agent_tools.py chat_history.py voice_pipeline.py ./
 
 VOLUME ["/data/chroma"]
 EXPOSE 8000

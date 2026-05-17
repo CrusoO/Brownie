@@ -8,9 +8,10 @@ services:
     environment:
       BROWNIE_MEMORY_DIR: /data/chroma
       BROWNIE_CORS_ORIGINS: http://localhost:${BROWNIE_FRONTEND_PORT:-3002},http://127.0.0.1:${BROWNIE_FRONTEND_PORT:-3002},http://localhost:3000,http://127.0.0.1:3000,http://frontend:3000
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      BROWNIE_MODEL: ${BROWNIE_MODEL:-gpt-4o-mini}
+      BROWNIE_MODEL: ${BROWNIE_MODEL:-llama-3.3-70b-versatile}
     volumes:
       - brownie-memory:/data/chroma
       - /var/run/docker.sock:/var/run/docker.sock

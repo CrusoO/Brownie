@@ -14,14 +14,19 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tupl
 
 import chromadb
 from chromadb.api.types import Documents, Embeddings
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from agent_tools import execute_play_music, execute_web_search
+from chat_history import ChatHistoryStore, ChatTurn
+
 try:
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
     from langchain_openai import ChatOpenAI
 except Exception:  # pragma: no cover - the fallback brain keeps the API runnable.
+    AIMessage = None
     HumanMessage = None
     SystemMessage = None
     ChatOpenAI = None
@@ -58,14 +63,38 @@ class Settings(BaseModel):
             if origin.strip()
         ]
     )
+    groq_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("GROQ_API_KEY"))
     openai_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
     openai_base_url: Optional[str] = Field(default_factory=lambda: os.getenv("OPENAI_BASE_URL"))
     openai_model: str = Field(default_factory=lambda: os.getenv("BROWNIE_MODEL", "gpt-4o-mini"))
+
+    @property
+    def llm_api_key(self) -> Optional[str]:
+        return self.groq_api_key or self.openai_api_key
+
+    @property
+    def llm_base_url(self) -> Optional[str]:
+        if self.openai_base_url:
+            return self.openai_base_url
+        if self.groq_api_key:
+            return "https://api.groq.com/openai/v1"
+        return None
+
+    @property
+    def llm_model(self) -> str:
+        if os.getenv("BROWNIE_MODEL"):
+            return self.openai_model
+        if self.groq_api_key:
+            return "llama-3.3-70b-versatile"
+        return self.openai_model
     sandbox_image: str = Field(default_factory=lambda: os.getenv("BROWNIE_SANDBOX_IMAGE", "python:3.12-alpine"))
     sandbox_timeout_seconds: int = Field(
         default_factory=lambda: int(os.getenv("BROWNIE_SANDBOX_TIMEOUT_SECONDS", "8"))
     )
     max_python_chars: int = Field(default_factory=lambda: int(os.getenv("BROWNIE_MAX_PYTHON_CHARS", "12000")))
+    chat_history_max_turns: int = Field(
+        default_factory=lambda: int(os.getenv("BROWNIE_CHAT_HISTORY_TURNS", "40"))
+    )
 
 
 class ChatRequest(BaseModel):
@@ -142,6 +171,7 @@ class BrownieState(TypedDict, total=False):
     run_id: str
     session_id: str
     user_message: str
+    chat_history: List[ChatTurn]
     memory_context: List[str]
     workflow_context: List[str]
     route: Literal["talk", "tool"]
@@ -477,31 +507,83 @@ class BrownieAgent:
         memory: VectorMemory,
         workflows: WorkflowStore,
         sandbox: DockerSandbox,
+        chat_history: ChatHistoryStore,
     ) -> None:
         self.settings = settings
         self.memory = memory
         self.workflows = workflows
         self.sandbox = sandbox
+        self.chat_history = chat_history
         self.llm = self._build_llm()
         self.graph = self._build_graph()
 
     def _build_llm(self) -> Any:
-        api_key = self.settings.openai_api_key
-        if not api_key and self.settings.openai_base_url:
+        api_key = self.settings.llm_api_key
+        if not api_key and self.settings.llm_base_url:
             api_key = "ollama"
 
         if not api_key or ChatOpenAI is None:
             return None
 
         kwargs: dict[str, Any] = {
-            "model": self.settings.openai_model,
+            "model": self.settings.llm_model,
             "api_key": api_key,
             "temperature": 0.2,
+            "streaming": True,
         }
-        if self.settings.openai_base_url:
-            kwargs["base_url"] = self.settings.openai_base_url
+        if self.settings.llm_base_url:
+            kwargs["base_url"] = self.settings.llm_base_url
 
         return ChatOpenAI(**kwargs)
+
+    def _router_tools(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "python_sandbox",
+                    "description": "Run Python code in an isolated Docker sandbox.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string", "description": "Python source code to execute"},
+                        },
+                        "required": ["code"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web for current information.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query"},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "play_music",
+                    "description": "Play a song or music. Use when the user wants to hear music.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Song name, artist, or description",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+        ]
 
     def _build_graph(self) -> Any:
         graph = StateGraph(BrownieState)
@@ -562,13 +644,23 @@ class BrownieAgent:
             2,
         )
         workflow_context = [self.workflows.format_for_prompt(workflow) for workflow in workflow_matches]
+        history = await asyncio.to_thread(
+            self.chat_history.list,
+            state["session_id"],
+            self.settings.chat_history_max_turns,
+        )
         event = await self._event(
             state,
             "memory.loaded",
-            "Checked long-term memory.",
-            {"matches": len(memories), "workflows": len(workflow_context)},
+            "Retrieving context from long-term memory.",
+            {
+                "matches": len(memories),
+                "workflows": len(workflow_context),
+                "chat_turns": len(history),
+            },
         )
         return {
+            "chat_history": history,
             "memory_context": memories,
             "workflow_context": workflow_context,
             "trace": [*state.get("trace", []), event],
@@ -578,13 +670,10 @@ class BrownieAgent:
         llm_error = None
         message = state["user_message"]
         heuristic_decision = self._fallback_decision(message)
-        should_use_llm_router = (
-            self.llm is not None
-            and self._needs_llm_routing(message)
-            and heuristic_decision.get("route") != "tool"
-        )
 
-        if should_use_llm_router:
+        if heuristic_decision.get("route") == "tool":
+            decision = heuristic_decision
+        elif self.llm:
             try:
                 decision = await self._llm_decision(state)
             except Exception as exc:
@@ -603,7 +692,7 @@ class BrownieAgent:
         event = await self._event(
             state,
             "agent.route",
-            "Chose the next action.",
+            "Planning the next action.",
             event_data,
         )
         updates: BrownieState = {
@@ -619,32 +708,51 @@ class BrownieAgent:
     async def run_tool(self, state: BrownieState) -> BrownieState:
         tool_name = state.get("tool_name")
         tool_input = state.get("tool_input", {})
-        if tool_name != "python_sandbox":
+        tool_labels = {
+            "python_sandbox": "Running Python inside the Docker sandbox.",
+            "web_search": "Searching the web for current information.",
+            "play_music": "Finding music to play.",
+        }
+        start_event = await self._event(
+            state,
+            "tool.started",
+            tool_labels.get(tool_name or "", "Running tool."),
+            {"tool_name": tool_name},
+        )
+        state = {**state, "trace": [*state.get("trace", []), start_event]}
+
+        if tool_name == "python_sandbox":
+            result = await self.sandbox.run_python(str(tool_input.get("code", "")))
+        elif tool_name == "web_search":
+            result = await asyncio.to_thread(
+                execute_web_search,
+                str(tool_input.get("query", state["user_message"])),
+            )
+        elif tool_name == "play_music":
+            result = await asyncio.to_thread(
+                execute_play_music,
+                str(tool_input.get("query", state["user_message"])),
+            )
+        else:
             result = {
                 "ok": False,
                 "stdout": "",
                 "stderr": f"Unknown tool: {tool_name}",
                 "exit_code": 1,
             }
-        else:
-            start_event = await self._event(
-                state,
-                "tool.started",
-                "Running Python inside the Docker sandbox.",
-                {"tool_name": "python_sandbox"},
-            )
-            state = {**state, "trace": [*state.get("trace", []), start_event]}
-            result = await self.sandbox.run_python(str(tool_input.get("code", "")))
+
+        finish_data: dict[str, Any] = {
+            "tool_name": tool_name,
+            "ok": result.get("ok", False),
+        }
+        if "exit_code" in result:
+            finish_data["exit_code"] = result["exit_code"]
 
         finish_event = await self._event(
             state,
             "tool.finished",
             "Tool execution finished.",
-            {
-                "tool_name": tool_name,
-                "ok": result["ok"],
-                "exit_code": result["exit_code"],
-            },
+            finish_data,
         )
         return {
             "tool_result": result,
@@ -655,7 +763,7 @@ class BrownieAgent:
         llm_error = state.get("llm_error")
         if self.llm and not llm_error:
             try:
-                response = await self._llm_response(state)
+                response = await self._llm_response(state, stream_tokens=True)
             except Exception as exc:
                 llm_error = self._format_llm_error(exc)
                 response = self._fallback_response(state, llm_error=llm_error)
@@ -689,16 +797,45 @@ class BrownieAgent:
             route=state.get("route", "talk"),
             tool_name=state.get("tool_name"),
         )
+        await asyncio.to_thread(
+            self.chat_history.append_exchange,
+            state["session_id"],
+            state["user_message"],
+            state.get("response", ""),
+        )
         event = await self._event(
             state,
             "memory.saved",
-            "Saved this action and outcome to long-term memory.",
+            "Saving this turn to long-term memory.",
             {"memory_id": memory_id},
         )
         return {
             "memory_ids": [*state.get("memory_ids", []), memory_id],
             "trace": [*state.get("trace", []), event],
         }
+
+    def _session_context_block(self, state: BrownieState) -> str:
+        memory = "\n\n".join(state.get("memory_context", [])) or "No relevant long-term memory."
+        workflows = "\n\n".join(state.get("workflow_context", [])) or "No matching taught workflows."
+        tool_result = state.get("tool_result")
+        tool_summary = json.dumps(tool_result, ensure_ascii=True) if tool_result else "No tool was used."
+        return (
+            f"Relevant long-term memory:\n{memory}\n\n"
+            f"Taught workflows:\n{workflows}\n\n"
+            f"Tool result this turn:\n{tool_summary}"
+        )
+
+    def _build_llm_messages(self, state: BrownieState, system: str) -> List[Any]:
+        if SystemMessage is None or HumanMessage is None:
+            return []
+
+        messages: List[Any] = [
+            SystemMessage(content=f"{system}\n\n{self._session_context_block(state)}"),
+        ]
+        if AIMessage is not None:
+            messages.extend(self.chat_history.to_langchain_messages(state.get("chat_history", [])))
+        messages.append(HumanMessage(content=state["user_message"]))
+        return messages
 
     async def _event(
         self,
@@ -720,42 +857,59 @@ class BrownieAgent:
             await sink(event)
         return event
 
+    async def _emit_token(self, state: BrownieState, token: str) -> None:
+        sink = trace_sink.get()
+        if not sink or not token:
+            return
+        await sink(
+            {
+                "id": str(uuid.uuid4()),
+                "run_id": state["run_id"],
+                "type": "agent.response.token",
+                "message": token,
+                "data": {},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
     async def _llm_decision(self, state: BrownieState) -> dict[str, Any]:
         if HumanMessage is None or SystemMessage is None:
             return self._fallback_decision(state["user_message"])
 
         system = (
-            "You are Brownie's router. Return only compact JSON. "
-            "Choose route='tool' only when the user explicitly asks to run Python code or provides code to execute. "
-            "If a taught workflow is present, route='talk' unless the user's message or workflow contains literal Python code to run. "
-            "The only available tool is python_sandbox. "
-            "For tool use, return: {\"route\":\"tool\",\"tool_name\":\"python_sandbox\",\"tool_input\":{\"code\":\"...\"}}. "
-            "Otherwise return: {\"route\":\"talk\",\"tool_name\":null,\"tool_input\":{}}."
+            "You are Brownie's router. Call a tool only when needed. "
+            "Use python_sandbox when the user wants Python executed or provides code. "
+            "Use web_search for current events, facts, or anything that needs up-to-date web info. "
+            "Use play_music when the user wants to hear a song or music. "
+            "Use the conversation history when the user refers to earlier messages (e.g. 'what did I say about…'). "
+            "If no tool is needed, respond with a short plain-text plan and do not call tools."
         )
-        context = "\n\n".join(state.get("memory_context", [])) or "No relevant memory."
-        workflows = "\n\n".join(state.get("workflow_context", [])) or "No matching taught workflows."
-        raw = await self.llm.ainvoke(
-            [
-                SystemMessage(content=system),
-                HumanMessage(
-                    content=(
-                        f"Relevant memory:\n{context}\n\n"
-                        f"Taught workflows:\n{workflows}\n\n"
-                        f"User message:\n{state['user_message']}"
-                    )
-                ),
-            ]
-        )
-        return self._normalize_decision(self._json_from_text(raw.content), state["user_message"])
+        messages = self._build_llm_messages(state, system)
 
-    async def _llm_response(self, state: BrownieState) -> str:
+        llm_router = self.llm.bind_tools(self._router_tools())
+        raw = await llm_router.ainvoke(messages)
+        tool_calls = getattr(raw, "tool_calls", None) or []
+        if tool_calls:
+            call = tool_calls[0]
+            tool_name = call.get("name")
+            tool_input = call.get("args") if isinstance(call.get("args"), dict) else {}
+            if tool_name in {"python_sandbox", "web_search", "play_music"}:
+                return {
+                    "route": "tool",
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                }
+
+        return {
+            "route": "talk",
+            "tool_name": None,
+            "tool_input": {},
+        }
+
+    async def _llm_response(self, state: BrownieState, stream_tokens: bool = False) -> str:
         if HumanMessage is None or SystemMessage is None:
             return self._fallback_response(state)
 
-        memory = "\n\n".join(state.get("memory_context", [])) or "No relevant memory."
-        workflows = "\n\n".join(state.get("workflow_context", [])) or "No matching taught workflows."
-        tool_result = state.get("tool_result")
-        tool_summary = json.dumps(tool_result, ensure_ascii=True) if tool_result else "No tool was used."
         system = (
             "You are Brownie, a smart, friendly, and slightly witty AI assistant. "
             "Speak like a human friend, not a robot. Keep responses short and natural. "
@@ -763,28 +917,43 @@ class BrownieAgent:
             "If the user gives a command, respond briefly and confirm action. "
             "If it's a question, answer clearly but casually. Never be overly long unless asked. "
             "If user says 'stop', immediately stop speaking. "
-            "Remember previous interactions in this session and refer naturally to past context. "
-            "Use the visible memory and tool result to answer clearly. "
+            "Use the conversation history in this session to answer follow-ups (e.g. 'what did I ask before?', "
+            "'remind me about…', 'the thing we discussed'). Quote or paraphrase earlier turns when helpful. "
+            "Use long-term memory and tool results for facts; use chat history for what was said in this chat. "
             "When a taught workflow matches the user request, execute the workflow conversationally: "
             "state what you can do now, use any available tool result, and ask for confirmation only for unsafe or external actions. "
             "Do not claim you changed files, opened apps, sent messages, or contacted services unless a tool result proves it. "
             "Do not reveal hidden chain-of-thought; summarize actions and outcomes instead. "
             "Examples of good responses: 'Got it, turning on the camera 📸' or 'Alright, I'll stay quiet now.'"
         )
-        raw = await self.llm.ainvoke(
-            [
-                SystemMessage(content=system),
-                HumanMessage(
-                    content=(
-                        f"Relevant memory:\n{memory}\n\n"
-                        f"Taught workflows:\n{workflows}\n\n"
-                        f"Tool result:\n{tool_summary}\n\n"
-                        f"User message:\n{state['user_message']}"
-                    )
-                ),
-            ]
-        )
-        return str(raw.content).strip()
+        messages = self._build_llm_messages(state, system)
+
+        if not stream_tokens:
+            raw = await self.llm.ainvoke(messages)
+            return str(raw.content).strip()
+
+        parts: list[str] = []
+        async for chunk in self.llm.astream(messages):
+            token = self._chunk_text(chunk)
+            if not token:
+                continue
+            parts.append(token)
+            await self._emit_token(state, token)
+        return "".join(parts).strip()
+
+    def _chunk_text(self, chunk: Any) -> str:
+        content = getattr(chunk, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(str(item.get("text", "")))
+                elif isinstance(item, str):
+                    text_parts.append(item)
+            return "".join(text_parts)
+        return str(content or "")
 
     def _fallback_decision(self, message: str) -> dict[str, Any]:
         code = self._extract_python(message)
@@ -795,6 +964,29 @@ class BrownieAgent:
                 "tool_input": {"code": code},
             }
 
+        lowered = message.lower()
+        if re.search(r"\b(play|start)\b.*\b(music|song|track)\b", lowered) or re.search(
+            r"\bplay\b.+\b(on spotify|for me)\b", lowered
+        ):
+            query = re.sub(
+                r"^(please\s+)?(play|start)\s+(the\s+)?(song|music|track)?\s*",
+                "",
+                message,
+                flags=re.IGNORECASE,
+            ).strip(" .")
+            return {
+                "route": "tool",
+                "tool_name": "play_music",
+                "tool_input": {"query": query or message},
+            }
+
+        if re.search(r"\b(search|look up|google|find out|what is|who is|latest)\b", lowered):
+            return {
+                "route": "tool",
+                "tool_name": "web_search",
+                "tool_input": {"query": message},
+            }
+
         return {
             "route": "talk",
             "tool_name": None,
@@ -803,6 +995,23 @@ class BrownieAgent:
 
     def _fallback_response(self, state: BrownieState, llm_error: Optional[str] = None) -> str:
         tool_result = state.get("tool_result")
+        tool_name = state.get("tool_name")
+        if tool_result and tool_name == "web_search":
+            if tool_result.get("ok"):
+                lines = [
+                    f"- {item.get('title', 'Result')}: {item.get('snippet', '')} ({item.get('url', '')})"
+                    for item in tool_result.get("results", [])[:3]
+                ]
+                return "Here's what I found:\n\n" + ("\n".join(lines) if lines else "No results.")
+            return f"Search failed: {tool_result.get('error', 'unknown error')}"
+
+        if tool_result and tool_name == "play_music" and tool_result.get("ok"):
+            return (
+                f"Here's music for \"{tool_result.get('query', 'your request')}\":\n"
+                f"Spotify: {tool_result.get('spotify_url')}\n"
+                f"YouTube: {tool_result.get('youtube_url')}"
+            )
+
         if tool_result:
             stdout = (tool_result.get("stdout") or "").strip()
             stderr = (tool_result.get("stderr") or "").strip()
@@ -828,21 +1037,9 @@ class BrownieAgent:
 
         return (
             f"Hey there! I'm running and ready to help. "
-            f"Add your OpenAI API key to get full AI responses, or I can still run Python code and remember things for you. {memory_hint}"
+            f"Add GROQ_API_KEY (free at console.groq.com) for fast AI responses, "
+            f"or I can still search the web, queue music links, run Python, and remember things for you. {memory_hint}"
         )
-
-    def _needs_llm_routing(self, message: str) -> bool:
-        lowered = message.lower()
-        routing_markers = (
-            "python",
-            "py",
-            "code",
-            "script",
-            "execute",
-            "run",
-            "```",
-        )
-        return any(marker in lowered for marker in routing_markers)
 
     def _format_llm_error(self, exc: Exception) -> str:
         text = str(exc)
@@ -906,8 +1103,14 @@ settings = Settings()
 memory = VectorMemory(settings)
 workflows = WorkflowStore(settings)
 sandbox = DockerSandbox(settings)
-agent = BrownieAgent(settings, memory, workflows, sandbox)
+chat_history = ChatHistoryStore(settings.memory_dir, max_turns=settings.chat_history_max_turns)
+agent = BrownieAgent(settings, memory, workflows, sandbox, chat_history)
 request_cache = SimpleRequestCache(max_size=50, ttl_seconds=300)
+
+
+def _should_use_request_cache(request: ChatRequest) -> bool:
+    """Skip cache when the session has prior turns so follow-ups stay contextual."""
+    return not chat_history.has_history(request.session_id)
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
 app.add_middleware(
@@ -930,16 +1133,65 @@ async def health() -> HealthResponse:
     )
 
 
+@app.get("/chat/history", response_model=List[ChatTurn])
+async def get_chat_history(session_id: str = "default") -> List[ChatTurn]:
+    return chat_history.list(session_id)
+
+
+@app.delete("/chat/history", status_code=204)
+async def clear_chat_history(session_id: str = "default") -> None:
+    chat_history.clear(session_id)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    # Check cache first for faster responses
-    cached = request_cache.get(request)
-    if cached:
-        return cached
-    
+    if _should_use_request_cache(request):
+        cached = request_cache.get(request)
+        if cached:
+            return cached
+
     response = await agent.run(request)
-    request_cache.set(request, response)
+    if _should_use_request_cache(request):
+        request_cache.set(request, response)
     return response
+
+
+@app.get("/stream/chat")
+async def stream_chat(
+    message: str = Query(..., min_length=1, max_length=24000),
+    session_id: str = Query(default="default", min_length=1, max_length=128),
+) -> StreamingResponse:
+    request = ChatRequest(message=message, session_id=session_id)
+
+    async def event_stream() -> Any:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        async def emit(event: dict[str, Any]) -> None:
+            await queue.put(event)
+
+        run_task = asyncio.create_task(agent.run(request, emit=emit))
+
+        while not run_task.done() or not queue.empty():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.05)
+                yield f"data: {json.dumps(event, ensure_ascii=True)}\n\n"
+            except asyncio.TimeoutError:
+                continue
+
+        response = await run_task
+        if _should_use_request_cache(request):
+            request_cache.set(request, response)
+        yield f"data: {json.dumps({'type': 'final', 'response': response.model_dump()}, ensure_ascii=True)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/workflows", response_model=List[Workflow])
@@ -1040,17 +1292,21 @@ async def websocket_chat(websocket: WebSocket) -> None:
             payload = await websocket.receive_json()
             request = ChatRequest(**payload)
             
-            # Check cache first for faster responses
-            cached = request_cache.get(request)
-            if cached:
-                await websocket.send_json({"type": "final", "response": cached.model_dump()})
-                continue
+            if _should_use_request_cache(request):
+                cached = request_cache.get(request)
+                if cached:
+                    await websocket.send_json({"type": "final", "response": cached.model_dump()})
+                    continue
 
             async def emit(event: dict[str, Any]) -> None:
+                if event.get("type") == "agent.response.token":
+                    await websocket.send_json({"type": "token", "token": event.get("message", "")})
+                    return
                 await websocket.send_json({"type": "trace", "event": event})
 
             response = await agent.run(request, emit=emit)
-            request_cache.set(request, response)
+            if _should_use_request_cache(request):
+                request_cache.set(request, response)
             await websocket.send_json({"type": "final", "response": response.model_dump()})
     except WebSocketDisconnect:
         return

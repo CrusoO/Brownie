@@ -6,18 +6,19 @@ Brownie is a proactive personal AI agent with a FastAPI backend, a LangGraph age
 
 The backend lives in `backend/main.py`.
 
-- `FastAPI` exposes `GET /health`, `POST /chat`, `WS /ws/chat`, and workflow endpoints under `/workflows`.
+- `FastAPI` exposes `GET /health`, `POST /chat`, `GET /stream/chat` (SSE), `GET/DELETE /chat/history`, `WS /ws/chat`, and workflow endpoints under `/workflows`.
 - `LangGraph` controls the agent state loop: `load_memory -> decide -> run_tool|talk -> persist_memory`.
+- `ChatHistoryStore` keeps the last 40 turns per session in `chat_history.json` so Brownie can answer follow-ups (“what did I say about…”) and restore the UI after refresh.
 - `ChromaDB` persists completed actions and outcomes in a vector collection, using a local hash embedding function so the system can boot without external embedding services.
 - `WorkflowStore` persists taught workflows in `workflows.json` beside the Chroma data, then injects matching workflows into Brownie's prompt context.
 - `DockerSandbox` runs Python in a locked-down container with no network, CPU/memory limits, a read-only filesystem, and a timeout.
-- `OPENAI_API_KEY` enables hosted LLM routing and response generation. `OPENAI_BASE_URL` can point Brownie at OpenAI-compatible providers such as Ollama, Groq, or OpenRouter. Without either, Brownie still runs with deterministic fallback routing.
+- `GROQ_API_KEY` (recommended for demos) or `OPENAI_API_KEY` enables fast LLM routing and streaming replies. `OPENAI_BASE_URL` can point Brownie at any OpenAI-compatible provider (Groq, Ollama, OpenRouter). Without a key, Brownie still runs with deterministic routing plus `web_search` and `play_music` tools.
 
 The frontend lives in `frontend/`.
 
 - `Next.js + TypeScript` provides the Brownie console.
 - Local shadcn/ui primitives are checked into `src/components/ui`.
-- The UI connects to `WS /ws/chat` and streams trace events before the final response.
+- The UI uses `GET /stream/chat` (Server-Sent Events) for live reasoning steps and token streaming, with `WS /ws/chat` as a fallback transport.
 - Browser voice input uses the Web Speech API when available, and voice output uses local `speechSynthesis`.
 - Face enrollment/verification uses the browser camera and stores a lightweight local profile in `localStorage`; it is a convenience identity check, not a security-grade biometric system.
 - Teach mode saves reusable trigger phrases and step lists through the backend workflow API.
